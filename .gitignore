@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+catboost_info/
+outputs/cache_cv.pkl

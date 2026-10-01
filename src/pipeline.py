@@ -1,0 +1,449 @@
+"""전 과정 실행: 진단 -> 피처 -> 모델 비교(롤링 백테스트) -> 최종 학습·시험 예측 -> 오차/피크 분석 -> 저감 시뮬레이션."""
+import json
+import time
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+
+from .config import (TEST_START, CV_FOLD_STARTS, CV_FOLD_DAYS, PEAK_EVENT_KW, FIG, TAB, PRED, OUT, SEED,
+                     BASIC_CHARGE_KRW_PER_KW, TARIFF_NAME)
+from .data import load_clean
+from .features import build_features, feature_list
+from .models import make_model, LGB_PARAMS
+from .experiment import sample_weight
+from .metrics import all_metrics, point_metrics
+from .peak_forecast import DailyPeakModel, day_frame
+from . import eda, error_analysis, peak_analysis, peak_shaving
+from .plotting import plt, save, C
+
+LOG = []
+
+FEAT_KOR = {
+    "hour": "시각", "quarter": "15분 구간", "slot": "하루 내 슬롯", "slot_sin": "슬롯(sin)", "slot_cos": "슬롯(cos)",
+    "dow": "요일", "weekend": "주말", "holiday": "공휴일", "month": "월", "doy": "연중 일차",
+    "prod": "생산계획량(당시간)", "staff": "공장인원(환산)", "prod_lag1h": "직전1h 생산계획", "prod_lag2h": "직전2h 생산계획",
+    "prod_lead1h": "다음1h 생산계획", "prod_lead2h": "다음2h 생산계획", "staff_lead1h": "다음1h 공장인원",
+    "is_prod_hour": "생산 시간 여부", "hours_from_first_prod": "첫 생산 후 경과h", "hours_to_last_prod": "마지막 생산까지 남은h",
+    "prod_start_hour": "생산 시작 시간", "prod_share_day": "일 생산 중 비중", "lunch": "점심시간",
+    "day_prod": "일 생산계획량", "day_prod_hours": "일 생산시간 수", "day_staff": "일 공장인원 합", "first_prod_hour": "첫 생산 시각",
+    "last_prod_hour": "마지막 생산 시각", "workday": "생산일", "full_workday": "정상 가동일", "prev_day_prod": "전일 생산계획",
+    "next_day_prod": "익일 생산계획", "days_since_workday": "직전 가동일 경과일", "restart_day": "재가동일",
+    "temp": "기온", "humid": "습도", "wind": "풍속", "rain": "시간 강수량", "cdd": "냉방도(기온-24)", "hdd": "난방도(18-기온)",
+    "temp_max": "일 최고기온", "temp_mean": "일 평균기온",
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+    LOG.append(msg)
+
+
+# --------------------------------------------------------------------------------------------
+# 모델 비교 구성: (표시명, 모델키, 예측시점, 피처셋, 가중치)
+#   피처셋 plan = 생산계획+달력+기상(전력 지연값 없음) / full = plan + 전력 지연값
+# --------------------------------------------------------------------------------------------
+COMPARE = [
+    ("B1 Naive(지난주 동시각)", "naive", "day_ahead", "full", "none"),
+    ("B2 규칙(직전 가동일 프로파일)", "rule", "day_ahead", "full", "none"),
+    ("Ridge 회귀", "ridge", "day_ahead", "plan", "none"),
+    ("RandomForest(가이드북 모델)", "rf", "day_ahead", "plan", "none"),
+    ("MLP(심층신경망)", "mlp", "day_ahead", "plan", "none"),
+    ("XGBoost", "xgb", "day_ahead", "plan", "none"),
+    ("CatBoost", "cat", "day_ahead", "plan", "none"),
+    ("LightGBM", "lgbm", "day_ahead", "plan", "none"),
+    # 설계 검증(ablation)
+    ("LightGBM + 전력지연값", "lgbm", "day_ahead", "full", "none"),
+    ("LightGBM + 전력지연값 + 증강가중", "lgbm", "day_ahead", "full", "aug_inv"),
+    ("LightGBM 1시간전(지연값 포함)", "lgbm", "hour_ahead", "full", "none"),
+    ("LightGBM - 기상 제외", "lgbm", "day_ahead", "plan_noW", "none"),
+    ("LightGBM + 증강가중", "lgbm", "day_ahead", "plan", "aug_inv"),
+]
+
+
+def feats_for(horizon, fs):
+    if fs == "plan":
+        return feature_list(horizon, weather=True, lags=False)
+    if fs == "plan_noW":
+        return feature_list(horizon, weather=False, lags=False)
+    return feature_list(horizon, weather=True, lags=True)
+
+
+def fit_pred(model_key, Xtr, Xte, feats, weight):
+    tr = Xtr[Xtr["kw"].notna()]
+    m = make_model(model_key)
+    m.fit(tr[feats], tr["kw"].values, sample_weight(tr, weight))
+    return m, np.clip(m.predict(Xte[feats]), 0, None)
+
+
+def folds(X):
+    for f0 in CV_FOLD_STARTS:
+        s = pd.Timestamp(f0)
+        e = s + pd.Timedelta(days=CV_FOLD_DAYS)
+        yield f0, X["ts"] < s, (X["ts"] >= s) & (X["ts"] < e)
+
+
+def step_compare(XD, XH):
+    rows, oos = [], {}
+    for name, key, hz, fs, w in COMPARE:
+        t = time.time()
+        X = XD if hz == "day_ahead" else XH
+        feats = feats_for(hz, fs)
+        parts = []
+        for f0, trm, pm in folds(X):
+            _, p = fit_pred(key, X[trm], X[pm], feats, w)
+            parts.append(X.loc[pm].assign(pred=p, fold=f0))
+        o = pd.concat(parts)
+        oos[name] = o
+        r = all_metrics(o)
+        r.update({"모델": name, "예측시점": "하루 전" if hz == "day_ahead" else "1시간 전", "피처": fs, "가중치": w,
+                  "학습·예측 시간(s)": round(time.time() - t, 1)})
+        rows.append(r)
+        log(f"  CV {name}: MAE={r['MAE']:.2f} RMSE={r['RMSE']:.2f} ({time.time() - t:.0f}s)")
+    # 앙상블: LightGBM + CatBoost 평균
+    ens = oos["LightGBM"].copy()
+    ens["pred"] = 0.5 * oos["LightGBM"]["pred"].values + 0.5 * oos["CatBoost"]["pred"].values
+    oos["앙상블(LightGBM+CatBoost)"] = ens
+    r = all_metrics(ens)
+    r.update({"모델": "앙상블(LightGBM+CatBoost)", "예측시점": "하루 전", "피처": "plan", "가중치": "none"})
+    rows.append(r)
+    R = pd.DataFrame(rows).set_index("모델")
+    R.round(3).to_csv(TAB / "model_comparison_cv.csv", encoding="utf-8-sig")
+    return R, oos
+
+
+def step_guidebook_replication(XD):
+    """가이드북 방식(무작위 70:30 분할, 15분 전 값 입력) vs 시간 순 분할 비교 -> 누수 정량화."""
+    X = XD.copy()
+    X["prev_q"] = X["kw"].shift(1)
+    feats = ["hour", "prod", "temp", "wind", "humid", "rain", "dow", "dom", "month", "prev_q"]
+    d = X.dropna(subset=["kw", "prev_q"])
+    from sklearn.ensemble import RandomForestRegressor
+    rf = lambda: RandomForestRegressor(n_estimators=200, max_depth=20, random_state=42, n_jobs=4)
+    tr, te = train_test_split(d, test_size=0.3, random_state=42)
+    m = rf().fit(tr[feats], tr["kw"])
+    mse_rand = np.mean((m.predict(te[feats]) - te["kw"]) ** 2)
+    # 무작위 분할 시험셋 중, 같은 패턴의 복사본이 학습셋에 있는 표본 비율
+    tr_keys = set(zip(tr["aug_group"], tr["slot"]))
+    leak_share = np.mean([(g >= 0) and ((g, s) in tr_keys) for g, s in zip(te["aug_group"], te["slot"])])
+    trt, tet = d[d.ts < TEST_START], d[d.ts >= TEST_START]
+    m2 = rf().fit(trt[feats], trt["kw"])
+    mse_time = np.mean((m2.predict(tet[feats]) - tet["kw"]) ** 2)
+    res = pd.DataFrame({"검증 방식": ["가이드북: 무작위 70:30 분할", "시간 순 분할(9/1~9/14 시험)"],
+                        "MSE": [mse_rand, mse_time], "RMSE": [np.sqrt(mse_rand), np.sqrt(mse_time)],
+                        "시험표본 중 학습셋에 동일패턴 복사본 존재 비율%": [100 * leak_share, 0.0]})
+    res.round(3).to_csv(TAB / "guidebook_replication.csv", index=False, encoding="utf-8-sig")
+    return res
+
+
+def step_final(XD, oos_cv):
+    """최종 모델 학습(9/1 이전 전체) -> 시험 구간 예측. 예측구간은 CV 표본외 잔차로 컨포멀 보정."""
+    feats = feats_for("day_ahead", "plan")
+    trm, tem = XD["ts"] < TEST_START, XD["ts"] >= TEST_START
+    Xtr, Xte = XD[trm & XD["kw"].notna()], XD[tem].copy()
+    m_lgb = lgb.LGBMRegressor(**LGB_PARAMS).fit(Xtr[feats], Xtr["kw"])
+    m_cat = make_model("cat").fit(Xtr[feats], Xtr["kw"].values)
+    Xte["pred_lgb"] = np.clip(m_lgb.predict(Xte[feats]), 0, None)
+    Xte["pred_cat"] = np.clip(m_cat.predict(Xte[feats]), 0, None)
+    Xte["pred"] = Xte["pred_lgb"]   # 최종 점예측: LightGBM(선정 근거는 보고서 참조)
+    qs = {}
+    for q in (0.1, 0.5, 0.85, 0.9):
+        qs[q] = lgb.LGBMRegressor(objective="quantile", alpha=q, **LGB_PARAMS).fit(Xtr[feats], Xtr["kw"])
+        Xte[f"q{int(q * 100)}"] = qs[q].predict(Xte[feats])
+
+    # --- CV에서 분위수 표본외 예측(컨포멀 보정·경보 임계값 선택용) ---
+    parts = []
+    for f0, trm_, pm_ in folds(XD):
+        tr_ = XD[trm_ & XD["kw"].notna()]
+        o = XD.loc[pm_].copy()
+        for q in (0.1, 0.85, 0.9):
+            o[f"q{int(q * 100)}"] = lgb.LGBMRegressor(objective="quantile", alpha=q, **LGB_PARAMS).fit(
+                tr_[feats], tr_["kw"]).predict(o[feats])
+        parts.append(o)
+    cvq = pd.concat(parts)
+    cvq["pred"] = oos_cv["LightGBM"]["pred"].values
+    v = cvq.dropna(subset=["kw"])
+    # CQR(Conformalized Quantile Regression): 80% 구간 [q10, q90]의 표본외 부적합 점수 분위수만큼 확장
+    score = np.maximum(v["q10"] - v["kw"], v["kw"] - v["q90"])
+    margin = float(np.quantile(score, 0.8))
+    cov_raw = float(np.mean((v["kw"] >= v["q10"]) & (v["kw"] <= v["q90"])))
+    Xte["lo80"] = np.clip(Xte["q10"] - margin, 0, None)
+    Xte["hi80"] = Xte["q90"] + margin
+    tv = Xte.dropna(subset=["kw"])
+    cov_test_raw = float(np.mean((tv["kw"] >= tv["q10"]) & (tv["kw"] <= tv["q90"])))
+    cov_test_cal = float(np.mean((tv["kw"] >= tv["lo80"]) & (tv["kw"] <= tv["hi80"])))
+
+    # --- 피크위험 경보 임계값: CV에서 F1 최대가 되는 (분위수, 임계 kW) 선택 ---
+    best = (None, None, -1)
+    yt = (v["kw"] >= PEAK_EVENT_KW).astype(int)
+    grid = []
+    for qc in ("pred", "q85", "q90"):
+        for thr in range(165, 196, 5):
+            f1 = f1_score(yt, (v[qc] >= thr).astype(int))
+            grid.append({"신호": qc, "임계kW": thr, "F1": f1})
+            if f1 > best[2]:
+                best = (qc, thr, f1)
+    pd.DataFrame(grid).round(3).to_csv(TAB / "alert_threshold_grid_cv.csv", index=False, encoding="utf-8-sig")
+    Xte["alert_signal"] = Xte[best[0]]
+    Xte["pred_alert"] = np.where(Xte[best[0]] >= best[1], PEAK_EVENT_KW, 0)   # error_analysis에서 ev_pred 판단용
+    Xte["peak_alert"] = (Xte[best[0]] >= best[1]).astype(int)
+    v_alert = (v[best[0]] >= best[1]).astype(int)
+
+    # --- 일 최대수요전력 예측 ---
+    D = day_frame(XD)
+    Dtr, Dte = D[D.index < TEST_START], D[D.index >= TEST_START]
+    dpm = DailyPeakModel().fit(Dtr)
+    dp = dpm.predict(Dte).join(Dte[["ymax", "full_workday"]])
+    dp["slot_model_max"] = Xte.groupby("date")["pred"].max()
+    dp["q90_max"] = Xte.groupby("date")["q90"].max()
+    # CV 일피크 성능
+    dparts = []
+    for f0 in CV_FOLD_STARTS:
+        s = pd.Timestamp(f0)
+        e = s + pd.Timedelta(days=CV_FOLD_DAYS)
+        mdl = DailyPeakModel().fit(D[D.index < s])
+        dparts.append(mdl.predict(D[(D.index >= s) & (D.index < e)]).join(D[["ymax", "full_workday"]]))
+    dcv = pd.concat(dparts)
+    dcv["slot_model_max"] = oos_cv["LightGBM"].groupby("date")["pred"].max()
+    dcv["q90_max"] = cvq.groupby("date")["q90"].max()
+
+    def dscore(df, col):
+        t = df.dropna(subset=["ymax"])
+        w = t["full_workday"] == 1
+        e = t[col] - t["ymax"]
+        return {"MAE(전체일)": e.abs().mean(), "MAE(가동일)": e[w].abs().mean(), "Bias(가동일)": e[w].mean(),
+                "MAPE%(가동일)": 100 * (e[w].abs() / t.loc[w, "ymax"]).mean()}
+
+    names = {"slot_model_max": "15분 예측의 일 최대값(LightGBM)", "q90_max": "P90 분위수의 일 최대값",
+             "dmax_rule": "규칙(직전 가동일 최대값)", "dmax_model": "일 단위 LightGBM", "dmax_pred": "피크 앙상블(제안)"}
+    drows = []
+    for col, nm in names.items():
+        drows.append({"방법": nm, "구간": "CV(7~8월)", **dscore(dcv, col)})
+        drows.append({"방법": nm, "구간": "시험(9/1~14)", **dscore(dp, col)})
+    DP = pd.DataFrame(drows)
+    DP.round(2).to_csv(TAB / "daily_peak_comparison.csv", index=False, encoding="utf-8-sig")
+
+    # --- 시험 지표 ---
+    test_rows = {}
+    for col, nm in [("pred_lgb", "LightGBM(최종)"), ("pred_cat", "CatBoost")]:
+        test_rows[nm] = all_metrics(Xte.assign(pred=Xte[col]))
+    ens = Xte.assign(pred=0.5 * Xte["pred_lgb"] + 0.5 * Xte["pred_cat"])
+    test_rows["앙상블(LightGBM+CatBoost)"] = all_metrics(ens)
+    test_rows["B1 Naive(지난주 동시각)"] = all_metrics(Xte.assign(pred=Xte["lag672"].fillna(Xte["lag96"])))
+    rule = make_model("rule").predict(Xte)
+    test_rows["B2 규칙(직전 가동일 프로파일)"] = all_metrics(Xte.assign(pred=rule))
+    _, prf = fit_pred("rf", XD[trm], XD[tem], feats, "none")
+    test_rows["RandomForest(가이드북 모델)"] = all_metrics(Xte.assign(pred=prf))
+    T = pd.DataFrame(test_rows).T
+    tv = Xte.dropna(subset=["kw"])
+    ev = (tv["kw"] >= PEAK_EVENT_KW).astype(int)
+    T["피크경보 F1(제안 경보규칙)"] = np.nan
+    T.loc["LightGBM(최종)", "피크경보 F1(제안 경보규칙)"] = f1_score(ev, tv["peak_alert"])
+    T.round(3).to_csv(TAB / "test_metrics.csv", encoding="utf-8-sig")
+
+    # 특성 중요도(SHAP)
+    import shap
+    ex = shap.TreeExplainer(m_lgb)
+    samp = Xtr[feats].sample(5000, random_state=SEED)
+    sv = ex.shap_values(samp)
+    imp = pd.Series(np.abs(sv).mean(0), index=feats).sort_values(ascending=False)
+    imp.rename(index=FEAT_KOR).round(3).to_csv(TAB / "forecast_shap_importance.csv", encoding="utf-8-sig")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    top = imp.head(15)[::-1]
+    ax.barh([FEAT_KOR.get(i, i) for i in top.index], top.values, color=C["pred"])
+    ax.set(xlabel="평균 |SHAP| (kW)", title="15분 전력 예측 주요 영향변수(LightGBM, 상위 15)")
+    save(fig, FIG / "forecast_shap_importance.png")
+    inter = ex.shap_interaction_values(samp.sample(1500, random_state=SEED))
+    Mv = np.abs(inter).mean(0).copy()
+    np.fill_diagonal(Mv, 0)
+    M = pd.DataFrame(Mv, index=feats, columns=feats)
+    pairs = M.where(np.triu(np.ones(M.shape), 1).astype(bool)).stack().sort_values(ascending=False).head(10)
+    pairs.index = [f"{FEAT_KOR.get(a, a)} x {FEAT_KOR.get(b, b)}" for a, b in pairs.index]
+    pairs.round(3).to_csv(TAB / "forecast_shap_interactions.csv", encoding="utf-8-sig")
+
+    info = {"conformal_margin_kW": margin, "cv_coverage_raw_q10_q90": cov_raw,
+            "test_coverage_raw": cov_test_raw, "test_coverage_conformal": cov_test_cal,
+            "alert_signal": best[0], "alert_threshold_kW": best[1], "alert_cv_F1": best[2],
+            "alert_test_F1": float(f1_score(ev, tv["peak_alert"]))}
+    return Xte, cvq, dp, dcv, T, DP, imp, pairs, info, m_lgb
+
+
+def step_save_predictions(Xte, dp):
+    cols = {"ts": "일시(15분 시작)", "date": "날짜", "hour": "시간", "quarter": "15분구간(0~3)", "kw": "실측(kW)",
+            "pred": "예측(kW)", "q10": "P10", "q90": "P90", "lo80": "80%구간 하한(보정)", "hi80": "80%구간 상한(보정)",
+            "peak_alert": "피크위험 경보(1=경보)"}
+    out = Xte[list(cols)].rename(columns=cols).round(2)
+    out.to_csv(PRED / "test_predictions_15min.csv", index=False, encoding="utf-8-sig")
+    # 원본 포맷(1행=1시간, 15분/30분/45분/60분 + 평균)
+    wide = Xte.pivot_table(index=["date", "hour"], columns="quarter", values="pred").round(2)
+    wide.columns = ["15분", "30분", "45분", "60분"]
+    wide["평균"] = wide.mean(axis=1).round(2)
+    wide = wide.reset_index()
+    wide.insert(0, "날짜", wide.pop("date").dt.strftime("%Y%m%d"))
+    wide = wide.rename(columns={"hour": "시간"})
+    wide.to_csv(PRED / "test_predictions_original_format.csv", index=False, encoding="utf-8-sig")
+    d = dp.rename(columns={"ymax": "실측 일최대(kW)", "dmax_pred": "예측 일최대(kW, 피크앙상블)",
+                           "dmax_model": "일단위모델", "dmax_rule": "규칙", "slot_model_max": "15분예측 최대",
+                           "q90_max": "P90 최대"})
+    d.round(2).to_csv(PRED / "test_daily_peak_predictions.csv", encoding="utf-8-sig")
+
+
+def step_plots(Xte, R, dp):
+    fig, ax = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    ax[0].fill_between(Xte["ts"], Xte["lo80"], Xte["hi80"], color=C["band"], alpha=.5, label="80% 예측구간(컨포멀 보정)")
+    ax[0].plot(Xte["ts"], Xte["kw"], color=C["actual"], lw=.8, label="실측")
+    ax[0].plot(Xte["ts"], Xte["pred"], color=C["pred"], lw=.9, label="예측(LightGBM, 하루 전)")
+    al = Xte[Xte["peak_alert"] == 1]
+    ax[0].scatter(al["ts"], np.full(len(al), 228), marker="|", color=C["peak"], s=30, label="피크위험 경보")
+    ax[0].axhline(PEAK_EVENT_KW, ls="--", color=C["peak"], lw=.7)
+    ax[0].set(ylabel="kW", title="시험 구간(2021-09-01 ~ 09-14) 15분 최대수요전력: 실측 vs 하루 전 예측")
+    ax[0].legend(frameon=False, ncol=4, fontsize=8, loc="lower left")
+    ax[1].plot(Xte["ts"], Xte["pred"] - Xte["kw"], color=C["muted"], lw=.7)
+    ax[1].axhline(0, color="k", lw=.5)
+    ax[1].set(ylabel="오차(예측-실측, kW)")
+    save(fig, FIG / "test_forecast.png")
+
+    # 하루 확대
+    day = Xte[Xte["date"] == "2021-09-06"]
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    ax.fill_between(day["slot"] / 4, day["lo80"], day["hi80"], color=C["band"], alpha=.5, label="80% 구간")
+    ax.plot(day["slot"] / 4, day["kw"], color=C["actual"], marker=".", ms=3, lw=1, label="실측")
+    ax.plot(day["slot"] / 4, day["pred"], color=C["pred"], lw=1.2, label="예측")
+    ax.axhline(PEAK_EVENT_KW, ls="--", color=C["peak"], lw=.7)
+    ax.set(xlabel="시각", ylabel="kW", title="2021-09-06(월, 재가동일) 하루 전 예측 상세")
+    ax.legend(frameon=False)
+    save(fig, FIG / "test_forecast_day.png")
+
+    # 모델 비교 막대
+    main = R.loc[[n for n, *_ in COMPARE[:8]] + ["앙상블(LightGBM+CatBoost)"]].sort_values("MAE")
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
+    col = [C["pred"] if "LightGBM" == i else C["muted"] for i in main.index]
+    ax[0].barh(main.index[::-1], main["MAE"][::-1], color=col[::-1])
+    ax[0].set(xlabel="MAE(kW)", title="롤링 백테스트(7~8월 8주) MAE")
+    ax[1].barh(main.index[::-1], main["DailyPeak_MAE(가동일)"][::-1], color=col[::-1])
+    ax[1].set(xlabel="가동일 일피크 MAE(kW)", title="일 최대수요전력 오차")
+    save(fig, FIG / "model_comparison.png")
+
+    # 일 피크 예측
+    t = dp.dropna(subset=["ymax"])
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    x = np.arange(len(t))
+    ax.bar(x - 0.2, t["ymax"], 0.4, color=C["actual"], label="실측 일최대")
+    ax.bar(x + 0.2, t["dmax_pred"], 0.4, color=C["peak"], label="피크 앙상블 예측")
+    ax.plot(x, t["slot_model_max"], "o--", color=C["pred"], ms=3, lw=.8, label="15분 예측의 최대값")
+    ax.set_xticks(x, [d.strftime("%m-%d") for d in t.index], rotation=45)
+    ax.set(ylabel="kW", title="시험 구간 일 최대수요전력 예측", ylim=(0, 240))
+    ax.legend(frameon=False, ncol=3, fontsize=8)
+    save(fig, FIG / "test_daily_peak.png")
+
+
+def step_shaving(XD, Xte, dp):
+    R, prof = peak_shaving.simulate(XD, alphas=(0.1, 0.2, 0.3), months=[7, 8, 9])
+    S = peak_shaving.billing_summary(R)
+    names = {"S1": "S1 순차 기동(기동부하 1~2h 선기동)", "S2": "S2 점심 교대(13시 재가동 분산)",
+             "S3": "S3 주간→저녁 생산 이전(17~22시)", "S4": "S4 ±2h 가동시점 최적화(상한)"}
+    S["시나리오"] = S["scenario"].map(names)
+    S.round(1).to_csv(TAB / "peak_shaving_summary.csv", index=False, encoding="utf-8-sig")
+    R.to_csv(TAB / "peak_shaving_daily.csv", index=False, encoding="utf-8-sig")
+
+    # 재가동일·고온일 별 효과
+    R2 = R.merge(XD.groupby("date")[["restart_day", "temp_max", "full_workday"]].first(), left_on="date", right_index=True)
+    R2 = R2[R2.full_workday == 1]
+    R2["day_type"] = np.select([R2.restart_day == 1, R2.temp_max >= 30], ["재가동일", "고온일(최고 30도+)"], "일반 가동일")
+    bytype = R2.assign(red=R2.orig_peak - R2.new_peak).groupby(["scenario", "alpha", "day_type"])["red"].mean().unstack().round(2)
+    bytype.to_csv(TAB / "peak_shaving_by_daytype.csv", encoding="utf-8-sig")
+
+    # 예측 기반 운영(시험 구간): 피크 앙상블의 '내일 일최대 예측' >= 경보 임계값인 날에만
+    # 하루 전 계획 규칙(주간 delta kW 블록을 저녁 여유 슬롯으로 재배치, peak_shaving.planned_block_shift)을 세우고
+    # 그 계획을 실측 부하에 적용했을 때의 결과를 평가 -> 실측을 미리 알 필요가 없는 현실적 평가
+    pol_rows, day_rows = [], []
+    test_days = [d for d in dp.index if not np.isnan(dp.loc[d, "ymax"])]
+    act_by_day = {d: XD[XD.date == d].sort_values("slot")["kw"].interpolate(limit_direction="both").values
+                  for d in test_days}
+    fc_by_day = {d: Xte[Xte.date == d].sort_values("slot")["pred"].values for d in test_days}
+    for delta in (10, 15, 20):
+        for thr in (None, 195, 190, 185, 180):
+            new_max, n_act, ecost = [], 0, 0.0
+            for d in test_days:
+                P = act_by_day[d]
+                act = thr is not None and dp.loc[d, "dmax_pred"] >= thr
+                Q = peak_shaving.planned_block_shift(P, fc_by_day[d], delta, dp.loc[d, "dmax_pred"]) if act else P
+                n_act += int(act)
+                new_max.append(np.nanmax(Q))
+                m = pd.Timestamp(d).month
+                ecost += peak_shaving.energy_cost(Q, m, range(96)) - peak_shaving.energy_cost(P, m, range(96))
+                if thr == 185 and delta == 15:
+                    day_rows.append({"date": d, "예측 일최대": dp.loc[d, "dmax_pred"], "실측 일최대": dp.loc[d, "ymax"],
+                                     "경보(조치)": int(act), "조치 후 일최대": np.nanmax(Q)})
+            pol_rows.append({"이전 블록 delta(kW)": delta, "경보 임계값(kW)": "조치 없음" if thr is None else thr,
+                             "조치일 수": n_act, "시험기간 최대수요전력(kW)": max(new_max),
+                             "가동일 일최대 평균(kW)": np.mean([m for m in new_max if m > 120]),
+                             "전력량요금 변화(원/2주)": ecost})
+    P = pd.DataFrame(pol_rows)
+    base_max = max(np.nanmax(v) for v in act_by_day.values())
+    P["최대수요전력 감소(kW)"] = base_max - P["시험기간 최대수요전력(kW)"]
+    P["연간 기본요금 절감(원, 요금적용전력 반영 가정)"] = P["최대수요전력 감소(kW)"] * BASIC_CHARGE_KRW_PER_KW * 12
+    P.round(1).to_csv(TAB / "forecast_driven_policy_test.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(day_rows).round(1).to_csv(TAB / "forecast_driven_policy_days.csv", index=False, encoding="utf-8-sig")
+
+    # 그림: 대표일 저감 전후
+    cand = R[(R.scenario == "S3") & (R.alpha == 0.2)].dropna(subset=["orig_peak"])
+    d0 = cand.assign(red=cand.orig_peak - cand.new_peak).sort_values(["orig_peak", "red"]).iloc[-1]["date"]
+    g = XD[XD.date == d0].sort_values("slot")
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    ax.plot(g["slot"] / 4, g["kw"], color=C["actual"], lw=1.2, label=f"실측({pd.Timestamp(d0):%m-%d})")
+    for scn, colr in [("S1", C["accent"]), ("S3", C["good"]), ("S4", C["peak"])]:
+        q = prof[(d0, scn, 0.2)]
+        ax.plot(g["slot"] / 4, q, lw=1, color=colr, label=f"{names[scn]} (α=0.2)")
+    ax.set(xlabel="시각", ylabel="kW", title="피크 저감 시뮬레이션 예시(전력량 보존)")
+    ax.legend(frameon=False, fontsize=7.5)
+    save(fig, FIG / "peak_shaving_example.png")
+
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    for scn, colr in [("S1", C["accent"]), ("S2", C["muted"]), ("S3", C["good"]), ("S4", C["peak"])]:
+        s = S[S.scenario == scn]
+        ax.plot(s["alpha"] * 100, s["가동일 일피크 평균 감소(%)"], "o-", color=colr, label=names[scn])
+    ax.set(xlabel="가동시점 조정 가능 부하 비중 α(%)", ylabel="가동일 일피크 평균 감소(%)", title="시나리오별 피크 저감 효과(7~9월)")
+    ax.legend(frameon=False, fontsize=8)
+    save(fig, FIG / "peak_shaving_sensitivity.png")
+    return S, bytype, P
+
+
+def run_all(reuse_cv=False):
+    t0 = time.time()
+    raw, hourly, L = load_clean()
+    log("[1] 데이터 진단·EDA")
+    rep, actions = eda.run(raw, hourly, L)
+    XD = build_features(L, "day_ahead")
+    XH = build_features(L, "hour_ahead")
+    log("[2] 모델 비교(롤링 원점 백테스트 8주)")
+    cache = OUT / "cache_cv.pkl"
+    if reuse_cv and cache.exists():
+        R, oos = pd.read_pickle(cache)
+        log("  (캐시된 백테스트 결과 사용)")
+    else:
+        R, oos = step_compare(XD, XH)
+        pd.to_pickle((R, oos), cache)
+    log("[3] 가이드북 방식 재현(무작위 분할 누수 확인)")
+    G = step_guidebook_replication(XD)
+    log("[4] 최종 모델 학습 및 시험 구간 예측")
+    Xte, cvq, dp, dcv, T, DP, imp, pairs, info, model = step_final(XD, oos)
+    step_save_predictions(Xte, dp)
+    step_plots(Xte, R, dp)
+    log("[5] 오차 분석(표본외: CV 8주 + 시험 2주)")
+    oos_all = pd.concat([cvq.assign(pred_alert=np.where(cvq[info["alert_signal"]] >= info["alert_threshold_kW"], PEAK_EVENT_KW, 0)),
+                         Xte])
+    _, et = error_analysis.run(oos_all, "oos")
+    log("[6] 피크 조건 분석")
+    pk = peak_analysis.run(XD)
+    log("[7] 피크 저감 시뮬레이션")
+    S, bytype, P = step_shaving(XD, Xte, dp)
+    summary = {"data_quality": rep, "final_model": "LightGBM(하루 전, 생산계획+달력+기상)",
+               "test_metrics": T.round(3).to_dict(orient="index"), "uncertainty_alert": info,
+               "tariff": {"name": TARIFF_NAME, "basic_krw_per_kw": BASIC_CHARGE_KRW_PER_KW},
+               "runtime_sec": round(time.time() - t0, 1)}
+    (OUT / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=float), encoding="utf-8")
+    (OUT / "run_log.txt").write_text("\n".join(LOG), encoding="utf-8")
+    log(f"완료: {time.time() - t0:.0f}s")
+    return locals()

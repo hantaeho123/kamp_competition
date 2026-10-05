@@ -5,7 +5,7 @@
 import numpy as np
 import pandas as pd
 
-from .config import PEAK_EVENT_KW, FIG, TAB
+from .config import PEAK_EVENT_KW, S2
 from .plotting import plt, save, C
 from .rules import fit_rules
 
@@ -16,14 +16,8 @@ def add_conditions(df):
     d["abs_err"] = d["err"].abs()
     d["prod_bin"] = pd.cut(d["prod"], [-1, 0, 300, 1000, 2000, 1e9], labels=["0", "1-300", "300-1천", "1천-2천", "2천+"])
     d["temp_bin"] = pd.cut(d["temp"], [-20, 15, 22, 26, 40], labels=["<15", "15-22", "22-26", "26+"])
-    day = d.groupby("date").agg(act_mean=("kw", "mean"), plan=("day_prod", "first"))
-    # 사후 진단용: 생산계획은 0인데 실제로 설비가 가동된 날(계획-실적 불일치)
-    day["plan_mismatch"] = ((day["plan"] == 0) & (day["act_mean"] > 60)).astype(int)
-    d = d.join(day[["plan_mismatch"]], on="date")
-    hf = d["hours_from_first_prod"]
-    d["phase"] = np.select(
-        [d["full_workday"] == 0, hf.between(-1, 1), d["hour"].isin([12, 13]), d["hour"] >= 17],
-        ["비가동일", "기동구간(첫 생산 -1~+1h)", "점심 정지·재가동(12~13시)", "저녁·야간(17시~)"], "주간 정상가동")
+    from .peak_types import clock_state
+    d["phase"] = np.where(d["full_workday"] == 0, "비가동일", d["hour"].map(clock_state))
     return d
 
 
@@ -38,24 +32,35 @@ def group_table(d, col):
 def run(oos: pd.DataFrame, tag="oos"):
     d = add_conditions(oos.dropna(subset=["kw"]).reset_index(drop=True))
     tables = {}
-    for col, name in [("phase", "운전구간"), ("hour", "시각"), ("prod_bin", "생산계획량"), ("temp_bin", "기온"),
-                      ("restart_day", "재가동일"), ("plan_mismatch", "계획-실적불일치일"), ("dow", "요일")]:
+    for col, name in [("phase", "운영상태"), ("hour", "시각"), ("prod_bin", "생산계획량"), ("temp_bin", "기온"),
+                      ("restart_day", "재가동일"), ("dow", "요일")]:
         t = group_table(d, col)
         t.index.name = name
-        t.to_csv(TAB / f"error_by_{col}_{tag}.csv", encoding="utf-8-sig")
+        t.to_csv(S2 / f"error_by_{col}_{tag}.csv", encoding="utf-8-sig")
         tables[col] = t
+
+    # 피크 시간 MAE vs 전체 MAE (피크 구간 유형은 pipeline.step_error에서 슬롯에 붙임)
+    if "peak_type" in d:
+        segs = [("전체", d), ("정상 가동일 08~17시", d[(d["full_workday"] == 1) & d["hour"].between(8, 16)]),
+                ("피크 시간(실측 180kW 이상)", d[d["kw"] >= PEAK_EVENT_KW]),
+                ("유형1 피크 구간(시작·재개 직후)", d[d["peak_type"] == 1]), ("유형2 피크 구간(가동 중)", d[d["peak_type"] == 2]),
+                ("피크 아닌 시간", d[d["kw"] < PEAK_EVENT_KW])]
+        pk = pd.DataFrame([{"구간": n, "슬롯 수": len(x), "MAE": x["abs_err"].mean(), "RMSE": np.sqrt((x["err"] ** 2).mean()),
+                            "Bias(예측-실측)": x["err"].mean(), "평균 실측(kW)": x["kw"].mean(),
+                            "MAE/평균 실측 %": 100 * x["abs_err"].mean() / x["kw"].mean()} for n, x in segs])
+        pk.round(2).to_csv(S2 / f"peak_time_mae_vs_overall_{tag}.csv", index=False, encoding="utf-8-sig")
+        tables["peak_vs_overall"] = pk
 
     # 큰 오차(상위 10%) 규칙 추출
     thr = d["abs_err"].quantile(0.9)
     d["big_err"] = (d["abs_err"] >= thr).astype(int)
-    feats = ["hours_from_first_prod", "hour", "prod", "temp", "restart_day", "quarter", "day_prod"]
-    names = ["첫생산후경과h", "시각", "생산계획량", "기온", "재가동일", "15분구간", "일생산계획"]
+    feats = ["hour", "prod", "temp", "restart_day", "quarter", "day_prod"]
+    names = ["시각", "생산계획량", "기온", "재가동일", "15분구간", "일생산계획"]
     dd = d.copy()
-    dd["hours_from_first_prod"] = dd["hours_from_first_prod"].fillna(-99)
     rules = fit_rules(dd, dd["big_err"].values, feats, names, depth=3, min_leaf=60)
     rules = rules.rename(columns={"가중평균": "큰오차 비율"})
     rules["큰오차 비율"] = (rules["큰오차 비율"] * 100).round(1)
-    rules.to_csv(TAB / f"error_rules_{tag}.csv", index=False, encoding="utf-8-sig")
+    rules.to_csv(S2 / f"error_rules_{tag}.csv", index=False, encoding="utf-8-sig")
     tables["rules"] = rules
     tables["big_err_threshold"] = thr
 
@@ -70,7 +75,7 @@ def run(oos: pd.DataFrame, tag="oos"):
     cm_temp = pd.crosstab(d["temp_bin"], d["cm"])
     cm_quarter = pd.crosstab([d["hour"].where(d["hour"].isin([8, 9, 13, 14]), -1), d["quarter"]], d["cm"])
     for k, v in [("phase", cm_phase), ("hour", cm_hour), ("temp", cm_temp), ("quarter", cm_quarter)]:
-        v.to_csv(TAB / f"event_cm_by_{k}_{tag}.csv", encoding="utf-8-sig")
+        v.to_csv(S2 / f"event_cm_by_{k}_{tag}.csv", encoding="utf-8-sig")
         tables[f"cm_{k}"] = v
 
     # 그림: 시각 x 요일 MAE 히트맵 + 운전구간별 MAE/기여도
@@ -85,6 +90,6 @@ def run(oos: pd.DataFrame, tag="oos"):
     ax[1].barh(t.index, t["MAE"], color=C["pred"])
     for i, (m, s) in enumerate(zip(t["MAE"], t["오차 기여%"])):
         ax[1].text(m + 0.3, i, f"기여 {s:.0f}%", va="center", fontsize=8)
-    ax[1].set(xlabel="MAE(kW)", title="운전구간별 오차")
-    save(fig, FIG / f"error_heatmap_{tag}.png")
+    ax[1].set(xlabel="MAE(kW)", title="운영상태별 오차")
+    save(fig, S2 / f"error_heatmap_{tag}.png")
     return d, tables

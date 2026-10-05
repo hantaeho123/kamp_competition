@@ -4,10 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "okm_augumented_2021.csv"
 OUT = ROOT / "outputs"
-FIG = OUT / "figures"
-TAB = OUT / "tables"
-PRED = OUT / "predictions"
-for _p in (FIG, TAB, PRED):
+# 분석 단계별 결과 폴더(표 CSV와 그림 PNG를 단계별로 함께 저장)
+S0 = OUT / "step0_preprocess_split"      # 0. 데이터 전처리 및 분할
+S1 = OUT / "step1_forecast"              # 1. 전력 예측
+S2 = OUT / "step2_error_analysis"        # 2. 예측오차 분석
+S3 = OUT / "step3_peak_extraction"       # 3. 실제 피크 추출
+S4 = OUT / "step4_peak_types"            # 4. 피크 두 유형 구분
+S5 = OUT / "step5_peak_conditions"       # 5. 유형별 발생조건
+S6 = OUT / "step6_mitigation"            # 6. 저감방안
+PRED = OUT / "predictions"               # 시험 구간 예측 결과 파일
+for _p in (S0, S1, S2, S3, S4, S5, S6, PRED):
     _p.mkdir(parents=True, exist_ok=True)
 
 SEED = 42

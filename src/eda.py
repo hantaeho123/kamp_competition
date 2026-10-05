@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from .config import FIG, TAB, QUARTER_COLS
+from .config import S0, QUARTER_COLS, TEST_START, CV_FOLD_STARTS, CV_FOLD_DAYS
 from .data import diagnose
 from .plotting import plt, save, C
 
@@ -10,7 +10,7 @@ from .plotting import plt, save, C
 def run(raw, hourly, L):
     # 품질 진단표
     rep = diagnose(raw)
-    pd.Series(rep, name="값").to_csv(TAB / "data_quality.csv", encoding="utf-8-sig")
+    pd.Series(rep, name="값").to_csv(S0 / "data_quality.csv", encoding="utf-8-sig")
     actions = pd.DataFrame([
         ["시간 컬럼 손상·행 정렬 오류", "07-13, 07-15 (48행)", "'시간'에 70~188 값, 손상값 기준 정렬로 실제 시각 불명", "전력 목표값 제외, 생산계획은 직전 4주 동요일 중앙값으로 대체"],
         ["전력 0 연속 구간", "08-28 18시~08-29 10시 (17행)", "4개 15분 값 모두 0, 공장인원도 결측 -> 계측 누락/정전", "목표값 결측 처리(학습·평가 제외)"],
@@ -21,7 +21,7 @@ def run(raw, hourly, L):
         ["(날짜,시간) 중복 키", "5건", "손상된 '시간' 값끼리 우연히 같음", "시간 재구성으로 해소"],
         ["계획-실적 불일치", "일요일 특근 등", "생산계획 0인데 설비 가동(최대 130kW)", "오차분석의 별도 조건으로 분리"],
     ], columns=["항목", "범위", "근거", "처리"])
-    actions.to_csv(TAB / "data_cleaning_actions.csv", index=False, encoding="utf-8-sig")
+    actions.to_csv(S0 / "data_cleaning_actions.csv", index=False, encoding="utf-8-sig")
 
     day = hourly.groupby("date").agg(pmax=("avg", "max"), pmean=("avg", "mean"), prod=("prod", "sum"),
                                      aug=("aug_size", "first"), dow=("dow", "first"))
@@ -39,7 +39,7 @@ def run(raw, hourly, L):
     ax[0].legend(frameon=False, ncol=4, fontsize=8)
     ax[1].bar(day.index, day["prod"] / 1000, color=C["muted"])
     ax[1].set(ylabel="일 생산계획(천개)")
-    save(fig, FIG / "eda_daily_overview.png")
+    save(fig, S0 / "eda_daily_overview.png")
 
     # 그림2: 증강 그룹 달력
     cal = day.assign(m=day.index.month, d=day.index.day).pivot(index="m", columns="d", values="aug")
@@ -50,7 +50,7 @@ def run(raw, hourly, L):
     ax.set(xlabel="일", title="증강 복사 그룹 크기(같은 전력 패턴을 가진 날 수, log2) — 7~9월은 거의 원본")
     cb = plt.colorbar(im, ax=ax)
     cb.set_ticks([0, 1, 2, 3, 4], labels=["1", "2", "4", "8", "16"])
-    save(fig, FIG / "eda_augmentation_calendar.png")
+    save(fig, S0 / "eda_augmentation_calendar.png")
 
     # 그림3: 요일별 평균 15분 프로파일 + 생산계획 vs 전력
     fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
@@ -67,7 +67,7 @@ def run(raw, hourly, L):
     ax[1].set(xscale="symlog", xlabel="시간당 생산계획량(개, symlog)", ylabel="시간 내 최대 15분 수요전력(kW)",
               title="생산계획량 vs 전력(색: 시각)")
     plt.colorbar(sc, ax=ax[1])
-    save(fig, FIG / "eda_profiles.png")
+    save(fig, S0 / "eda_profiles.png")
 
     # 그림4: 상관행렬
     cols = ["avg", "prod", "staff", "temp", "humid", "wind", "rain", "hour", "dow", "month", "tariff_season", "labor_mult"]
@@ -82,6 +82,38 @@ def run(raw, hourly, L):
             ax.text(j, i, f"{cm.values[i, j]:.2f}", ha="center", va="center", fontsize=6.5)
     plt.colorbar(im, ax=ax)
     ax.set_title("변수 간 Spearman 상관")
-    save(fig, FIG / "eda_corr.png")
-    cm.round(3).to_csv(TAB / "eda_corr.csv", encoding="utf-8-sig")
+    save(fig, S0 / "eda_corr.png")
+    cm.round(3).to_csv(S0 / "eda_corr.csv", encoding="utf-8-sig")
     return rep, actions
+
+
+def split_table(X):
+    """시간 순 Train / Valid / Test 분할표(행 = 15분 슬롯). Valid는 롤링 원점 8개 fold."""
+    rows = []
+    y = X["kw"].notna()
+    for i, f0 in enumerate(CV_FOLD_STARTS, 1):
+        s = pd.Timestamp(f0)
+        e = s + pd.Timedelta(days=CV_FOLD_DAYS)
+        tr = (X["ts"] < s) & y
+        va = (X["ts"] >= s) & (X["ts"] < e) & y
+        rows.append({"구분": f"Valid fold {i}", "학습 구간": f"2021-01-01 ~ {(s - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
+                     "평가 구간": f"{s.date()} ~ {(e - pd.Timedelta(days=1)).date()}", "평가 슬롯 수": int(va.sum()),
+                     "평가 구간 내 복사일 수": int(X.loc[va & (X["aug_size"] > 1), "date"].nunique())})
+    t = pd.Timestamp(TEST_START)
+    tr = (X["ts"] < t) & y
+    te = (X["ts"] >= t) & y
+    rows.append({"구분": "Test(최종 1회)", "학습 구간": f"2021-01-01 ~ {(t - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
+                 "평가 구간": f"{t.date()} ~ {X['ts'].max().date()}", "평가 슬롯 수": int(te.sum()),
+                 "평가 구간 내 복사일 수": int(X.loc[te & (X["aug_size"] > 1), "date"].nunique())})
+    T = pd.DataFrame(rows)
+    T.to_csv(S0 / "train_valid_test_split.csv", index=False, encoding="utf-8-sig")
+    drop = pd.DataFrame([
+        ["평균", "예측 대상 4개 값의 평균(목표값 그 자체)", "제거"],
+        ["15분/30분/45분/60분(같은 시각)", "예측 대상", "입력에서 제거, 목표값으로만 사용"],
+        ["전기요금(계절)", "월만으로 결정(값 3개)", "제거(월과 중복)"],
+        ["인건비", "시각만으로 결정(9~17시 1.0, 그 외 1.5)", "제거(시각과 중복)"],
+        ["시간(원본)", "07-13, 07-15에 손상", "행 순서로 재구성한 시각 사용, 두 날 전력은 제외"],
+        ["전력 지연값(전일·전주 등)", "복사일이 날짜 간 연속성을 깨뜨림(백테스트 MAE 7.73 -> 11.99로 악화)", "최종 모델에서 제외"],
+    ], columns=["변수", "근거", "처리"])
+    drop.to_csv(S0 / "leakage_and_redundant_variables.csv", index=False, encoding="utf-8-sig")
+    return T

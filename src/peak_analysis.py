@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 from .rules import fit_rules
 
-from .config import PEAK_EVENT_KW, FIG, TAB, SEED
+from .config import PEAK_EVENT_KW, S5, SEED
 from .plotting import plt, save, C
 
 PEAK_FEATS = ["hour", "quarter", "dow", "restart_day", "days_since_workday", "prod", "prod_lag1h", "prod_lead1h",
@@ -45,7 +45,7 @@ def run(X: pd.DataFrame):
     share = d[d.event == 1].assign(w=1 / d["aug_size"]).groupby("hour")["w"].sum()
     out["event_share_by_hour"] = (share / share.sum() * 100).rename("이벤트 비중%")
     for k, v in out.items():
-        v.round(2).to_csv(TAB / f"peak_{k}.csv", encoding="utf-8-sig")
+        v.round(2).to_csv(S5 / f"peak_{k}.csv", encoding="utf-8-sig")
 
     # 그림: 시각 x 재가동일 이벤트율 / 시각별 평균 프로파일(재가동일 vs 일반 가동일)
     fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
@@ -62,7 +62,7 @@ def run(X: pd.DataFrame):
     ax[1].text(0.3, PEAK_EVENT_KW + 2, "피크위험 기준 180kW", fontsize=8)
     ax[1].set(xlabel="시각", ylabel="평균 15분 최대수요전력(kW)", title="가동일 평균 부하 프로파일")
     ax[1].legend(frameon=False)
-    save(fig, FIG / "peak_hour_restart.png")
+    save(fig, S5 / "peak_hour_restart.png")
 
     # (2) 설명용 분류모델(가동일만) + SHAP
     wd = d[d.full_workday == 1].copy()
@@ -73,13 +73,13 @@ def run(X: pd.DataFrame):
     sv = expl.shap_values(wd[PEAK_FEATS])
     sv = sv[1] if isinstance(sv, list) else sv
     imp = pd.Series(np.abs(sv).mean(0), index=PEAK_FEATS).sort_values(ascending=False)
-    imp.rename(index=KOR).round(4).to_csv(TAB / "peak_shap_importance.csv", encoding="utf-8-sig")
+    imp.rename(index=KOR).round(4).to_csv(S5 / "peak_shap_importance.csv", encoding="utf-8-sig")
     out["shap_importance"] = imp
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     top = imp.head(10)[::-1]
     ax.barh([KOR[i] for i in top.index], top.values, color=C["peak"])
     ax.set(xlabel="평균 |SHAP| (log-odds)", title="피크위험 이벤트 주요 영향요인(가동일)")
-    save(fig, FIG / "peak_shap_importance.png")
+    save(fig, S5 / "peak_shap_importance.png")
 
     # 상호작용: 시각 x 재가동일, 시각 x 기온
     inter = expl.shap_interaction_values(wd[PEAK_FEATS].sample(4000, random_state=SEED))
@@ -89,7 +89,7 @@ def run(X: pd.DataFrame):
     M = pd.DataFrame(Mv, index=PEAK_FEATS, columns=PEAK_FEATS)
     pairs = M.where(np.triu(np.ones(M.shape), 1).astype(bool)).stack().sort_values(ascending=False).head(10)
     pairs.index = [f"{KOR[a]} x {KOR[b]}" for a, b in pairs.index]
-    pairs.round(4).to_csv(TAB / "peak_shap_interactions.csv", encoding="utf-8-sig")
+    pairs.round(4).to_csv(S5 / "peak_shap_interactions.csv", encoding="utf-8-sig")
     out["shap_interactions"] = pairs
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
@@ -99,7 +99,7 @@ def run(X: pd.DataFrame):
                            sv[:, j], c=wd[col], s=3, cmap="coolwarm", alpha=0.5)
         ax[i].set(xlabel=KOR[feat], ylabel=f"SHAP({KOR[feat]})", title=f"{KOR[feat]} 효과 (색: {KOR[col]})")
         plt.colorbar(sc, ax=ax[i])
-    save(fig, FIG / "peak_shap_dependence.png")
+    save(fig, S5 / "peak_shap_dependence.png")
 
     # (3) 의사결정나무 규칙(현장 공유용)
     tf = ["hour", "restart_day", "temp", "prod", "hours_from_first_prod", "quarter"]
@@ -107,11 +107,11 @@ def run(X: pd.DataFrame):
                       depth=3, min_leaf=150)
     rules = rules.rename(columns={"가중평균": "피크위험 이벤트율"})
     rules["피크위험 이벤트율"] = (rules["피크위험 이벤트율"] * 100).round(1)
-    rules.to_csv(TAB / "peak_tree_rules.csv", index=False, encoding="utf-8-sig")
+    rules.to_csv(S5 / "peak_tree_rules.csv", index=False, encoding="utf-8-sig")
     out["tree_rules"] = rules
 
     # (4) 월별 최대피크 사례
     mp = d.loc[d.groupby("month")["kw"].idxmax(), ["month", "ts", "kw", "dow", "restart_day", "hour", "prod", "temp", "aug_size"]]
-    mp.to_csv(TAB / "peak_monthly_max.csv", index=False, encoding="utf-8-sig")
+    mp.to_csv(S5 / "peak_monthly_max.csv", index=False, encoding="utf-8-sig")
     out["monthly_max"] = mp
     return out

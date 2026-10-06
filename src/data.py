@@ -8,6 +8,7 @@
 3) 생산량 누락(07-13, 07-15: 전력은 정상 가동 수준인데 생산량 0) -> 직전 4주 동일 요일·시간 중앙값으로 대체 + 플래그
 4) 강수량은 일 누적값(1시 초기화, 0시에 전일 합계) -> 시간 강수량으로 변환
 5) 풍속·강수량 결측 4행 -> 선형보간
+   (공장인원은 전력에서 계산된 누수 변수라 모델 입력에 쓰지 않는다. diagnose 참고)
 6) 증강 복사일(하루 96개 15분 전력 패턴이 다른 날과 완전히 동일) -> aug_group/aug_size 플래그, 학습 가중치에 활용
 7) 15분 단위 0값(08-28 17:30~45, 08-29 11:00~15, 09-08 12:00~15, 6개 슬롯) -> 계측 누락으로 결측 처리
 """
@@ -15,7 +16,7 @@ import numpy as np
 import pandas as pd
 import holidays
 
-from .config import DATA_PATH, QUARTER_COLS
+from .config import DATA_PATH, QUARTER_COLS, DATA_START
 
 RENAME = {"날짜": "date_int", "시간": "hour_raw", "평균": "avg", "생산량": "prod", "기온": "temp",
           "풍속": "wind", "습도": "humid", "강수량": "rain_cum", "전기요금(계절)": "tariff_season",
@@ -44,6 +45,10 @@ def diagnose(raw: pd.DataFrame) -> dict:
     rep["평균 = 4구간 평균 일치(오차<=0.5)"] = f"{(avg_chk <= 0.5).mean():.1%}"
     calc_dow = dates.dt.dayofweek + 1
     rep["요일(day) 일치율"] = f"{(calc_dow == df.dow).mean():.1%}"
+    # 누수 검증: 공장인원 = 생산량 / (4개 15분 전력의 합) 인가?
+    m = (df["prod"] > 0) & (df["staff"] > 0)
+    recon = df.loc[m, "prod"] / df.loc[m, QUARTER_COLS].sum(axis=1)
+    rep["공장인원 = 생산량/(4구간 전력 합) 최대 오차"] = f"{(recon - df.loc[m, 'staff']).abs().max():.1e} ({int(m.sum())}행)"
     return rep
 
 
@@ -125,4 +130,7 @@ def to_long(hourly: pd.DataFrame) -> pd.DataFrame:
 def load_clean():
     raw = load_raw()
     hourly = clean_hourly(raw)
-    return raw, hourly, to_long(hourly)
+    L = to_long(hourly)
+    # 분석 범위 제한(7~9월 버전): 진단은 전체 원본(raw, hourly)으로 하고, 모델링 자료 L만 DATA_START 이후로 자른다
+    L = L[L["ts"] >= DATA_START].reset_index(drop=True)
+    return raw, hourly, L

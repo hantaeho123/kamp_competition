@@ -16,7 +16,7 @@ from .config import PEAK_EVENT_KW, S5, SEED
 from .plotting import plt, save, C
 
 PEAK_FEATS = ["hour", "quarter", "dow", "restart_day", "days_since_workday", "prod", "prod_lag1h", "prod_lead1h",
-              "staff", "hours_from_first_prod", "prod_start_hour", "day_prod", "temp", "humid", "month", "lunch"]
+              "hours_from_first_prod", "prod_start_hour", "day_prod", "temp", "humid", "month", "lunch"]
 KOR = {"hour": "시각", "quarter": "15분 구간", "dow": "요일", "restart_day": "재가동일(주말·휴무 후)",
        "days_since_workday": "직전 가동일 경과일", "prod": "생산계획량(당시간)", "prod_lag1h": "직전시간 생산량",
        "prod_lead1h": "다음시간 생산량", "staff": "공장인원(환산)", "hours_from_first_prod": "첫 생산 후 경과시간",

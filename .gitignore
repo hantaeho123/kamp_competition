@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 catboost_info/
 outputs/cache_cv.pkl
+소스코드.zip
+outputs/cache_tuning.pkl
+outputs/tuned_best.pkl

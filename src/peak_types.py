@@ -1,6 +1,6 @@
 """3~5단계: 실제 피크 구간 추출 -> 두 유형 구분 -> 유형별 발생조건.
 
-3단계 피크 구간: 15분 최대수요전력이 기준(180kW = 전체 슬롯 상위 5%) 이상인 연속 구간.
+3단계 피크 구간: 15분 최대수요전력이 기준(180kW, 이 값 이상인 슬롯이 전체의 5.0%) 이상인 연속 구간.
                  사이에 1슬롯(15분)만 기준 아래로 내려간 경우는 한 구간으로 합침.
 4단계 유형 구분: 구간마다 (상승폭, 지속시간, 직전 1시간 부하 수준)을 계산해 K-means로 묶음.
                  묶음 수는 실루엣 점수로 정함(2개가 최고). 복사일 중복을 막기 위해 '고유한 날'의 구간으로만 학습.
@@ -14,26 +14,12 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 from .config import PEAK_EVENT_KW, S3, S4, S5, SEED
+from .features import clock_state
 from .plotting import plt, save, C
 
 TYPE_NAME = {1: "유형1: 가동 시작·재개 직후 크게 오르는 피크", 2: "유형2: 가동 중 잠깐 더 오르는 피크"}
 TYPE_SHORT = {1: "유형1(시작·재개 직후)", 2: "유형2(가동 중)"}
 TYPE_COLOR = {1: C["peak"], 2: C["pred"]}
-
-
-def clock_state(hour):
-    """시각 기준 운영상태(가동일)."""
-    if hour < 7:
-        return "새벽(0~7시)"
-    if hour < 9:
-        return "오전 가동 시작(7~9시)"
-    if hour < 12:
-        return "오전 가동 중(9~12시)"
-    if hour < 14:
-        return "점심 정지·재개(12~14시)"
-    if hour < 17:
-        return "오후 가동 중(14~17시)"
-    return "저녁·야간(17시~)"
 
 
 def unique_days(X):
@@ -73,7 +59,7 @@ def extract_episodes(X, thr=PEAK_EVENT_KW):
                 "직전30분 상승(kW)": kw[i] - kw[max(i - 2, 0)],
                 "생산계획량(시작 시간)": r["prod"], "직전 시간 생산계획량": r["prod_lag1h"],
                 "생산계획 변화(개/h)": r["prod"] - (r["prod_lag1h"] if pd.notna(r["prod_lag1h"]) else 0),
-                "일 생산계획량": r["day_prod"], "공장인원": r["staff"], "재가동일": r["restart_day"], "기온": r["temp"],
+                "일 생산계획량": r["day_prod"], "재가동일": r["restart_day"], "기온": r["temp"],
                 "요일": r["dow"], "월": r["month"], "운영상태": clock_state(i // 4), "복사그룹크기": r["aug_size"],
             })
             i = j + 1
@@ -96,7 +82,7 @@ def step3_extract(X):
     work_days = X[X["full_workday"] == 1].groupby("date")["kw"].count()
     work_days = set(work_days[work_days >= 77].index)
     summ = pd.Series({
-        "기준(kW)": PEAK_EVENT_KW, "기준의 근거": "전체 15분 슬롯의 95번째 백분위수(상위 5%)",
+        "기준(kW)": PEAK_EVENT_KW, "기준의 근거": "180kW 이상 슬롯이 전체 15분 슬롯의 5.0%(상위 5%)",
         "전체 피크 구간 수": len(E), "고유일 기준 피크 구간 수": int(E["고유일"].sum()),
         "피크 발생일 수(고유일)": E.loc[E["고유일"] == 1, "date"].nunique(),
         "7~9월 정상 가동일 수": len([d for d in work_days if d >= pd.Timestamp("2021-07-01")]),
@@ -202,7 +188,7 @@ def step5_conditions(E, X):
     st = pd.crosstab(U["운영상태"], U["유형"]).rename(columns=TYPE_SHORT)
     st_pct = (st / st.sum() * 100).round(1).add_suffix(" 비중%")
     out["by_state"] = st.join(st_pct)
-    num = ["생산계획량(시작 시간)", "직전 시간 생산계획량", "생산계획 변화(개/h)", "일 생산계획량", "공장인원", "기온", "재가동일"]
+    num = ["생산계획량(시작 시간)", "직전 시간 생산계획량", "생산계획 변화(개/h)", "일 생산계획량", "기온", "재가동일"]
     rows = []
     for c in num:
         a, b = U.loc[U["유형"] == 1, c].dropna(), U.loc[U["유형"] == 2, c].dropna()

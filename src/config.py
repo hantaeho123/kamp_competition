@@ -1,9 +1,13 @@
 """전역 설정: 경로, 기간, 외부 기준값(요금), 난수 시드."""
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "okm_augumented_2021.csv"
-OUT = ROOT / "outputs"
+# 분석 범위: "all" = 전체 기간(2021-01-01 ~ 09-14), "789" = 복사일이 없는 원본 구간(7~9월)만 사용
+VARIANT = os.environ.get("KAMP_VARIANT", "all")
+DATA_START = "2021-07-01" if VARIANT == "789" else "2021-01-01"
+OUT = ROOT / ("outputs789" if VARIANT == "789" else "outputs")
 # 분석 단계별 결과 폴더(표 CSV와 그림 PNG를 단계별로 함께 저장)
 S0 = OUT / "step0_preprocess_split"      # 0. 데이터 전처리 및 분할
 S1 = OUT / "step1_forecast"              # 1. 전력 예측
@@ -25,6 +29,8 @@ TEST_START = "2021-09-01"
 # 롤링 원점 백테스트(모델 선택용) 주 단위 fold 시작일: 7~8월(증강 복사가 거의 없는 원본 구간)
 CV_FOLD_STARTS = ["2021-07-05", "2021-07-12", "2021-07-19", "2021-07-26",
                   "2021-08-09", "2021-08-16", "2021-08-23", "2021-08-30"]
+if VARIANT == "789":   # 7월 1일부터만 쓰므로 학습 자료가 2주 이상 쌓인 뒤부터 평가(6개 fold)
+    CV_FOLD_STARTS = CV_FOLD_STARTS[2:]
 CV_FOLD_DAYS = 7
 
 # 피크 위험 이벤트 정의: 15분 최대수요전력이 이 값 이상(전체 15분 슬롯의 상위 5%)

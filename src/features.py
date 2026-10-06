@@ -5,12 +5,30 @@
 - hour_ahead: 매 시각, 1시간(4슬롯) 뒤 15분 최대수요전력 예측(당일 실시간 피크 경보용)
 
 사용 가능 정보 원칙(누수 방지)
-- 생산량/공장인원: 가이드북 정의상 '해당 시점에 생산해야 할 생산량' = ERP 생산계획 -> 사전에 알 수 있는 값으로 사용
+- 생산량: 가이드북 정의상 '해당 시점에 생산해야 할 생산량' = ERP 생산계획 -> 사전에 알 수 있는 값으로 사용
+- 공장인원: 사용하지 않음. 공장인원 = 생산량 / (15분+30분+45분+60분 전력의 합)으로 계산된 값이라
+            생산량과 함께 쓰면 그 시간의 전력을 역산할 수 있는 누수 변수(data.diagnose에서 검증)
 - 기상: 실측값을 '완전한 일기예보'의 대리변수로 사용(보고서에 한계 명시, 기상 제외 모델로 민감도 확인)
 - 전력(목표) 지연값: 예측 시점 이전 값만 사용 (day_ahead >= 96슬롯, hour_ahead >= 4슬롯)
 """
 import numpy as np
 import pandas as pd
+
+
+def clock_state(hour):
+    """시각 기준 운영상태(가동일)."""
+    if hour < 7:
+        return "새벽(0~7시)"
+    if hour < 9:
+        return "오전 가동 시작(7~9시)"
+    if hour < 12:
+        return "오전 가동 중(9~12시)"
+    if hour < 14:
+        return "점심 정지·재개(12~14시)"
+    if hour < 17:
+        return "오후 가동 중(14~17시)"
+    return "저녁·야간(17시~)"
+
 
 HORIZON_MIN_LAG = {"day_ahead": 96, "hour_ahead": 4}
 
@@ -22,7 +40,6 @@ def _day_table(L: pd.DataFrame) -> pd.DataFrame:
     D = pd.DataFrame({
         "day_prod": g["prod"].sum(),
         "day_prod_hours": g["prod"].apply(lambda s: (s > 0).sum()),
-        "day_staff": g["staff"].sum(),
         "first_prod_hour": g.apply(lambda x: x.loc[x["prod"] > 0, "hour"].min() if (x["prod"] > 0).any() else np.nan),
         "last_prod_hour": g.apply(lambda x: x.loc[x["prod"] > 0, "hour"].max() if (x["prod"] > 0).any() else np.nan),
         "temp_max": g["temp"].max(), "temp_mean": g["temp"].mean(),
@@ -59,12 +76,10 @@ def build_features(L: pd.DataFrame, horizon: str = "day_ahead") -> pd.DataFrame:
 
     # ---- 생산계획(사전 정보) ----
     hp = L[L.quarter == 0].set_index("ts")["prod"]
-    hs = L[L.quarter == 0].set_index("ts")["staff"]
     hour_ts = X["ts"].dt.floor("h")
     for k in (1, 2):
         X[f"prod_lag{k}h"] = hour_ts.map(hp.shift(k)).values
         X[f"prod_lead{k}h"] = hour_ts.map(hp.shift(-k)).values
-    X["staff_lead1h"] = hour_ts.map(hs.shift(-1)).values
     X["is_prod_hour"] = (X["prod"] > 0).astype(int)
     X["hours_from_first_prod"] = X["hour"] - X["first_prod_hour"]
     X["hours_to_last_prod"] = X["last_prod_hour"] - X["hour"]
@@ -114,9 +129,9 @@ def build_features(L: pd.DataFrame, horizon: str = "day_ahead") -> pd.DataFrame:
 # 모델 입력 피처 목록
 BASE_FEATS = [
     "hour", "quarter", "slot", "slot_sin", "slot_cos", "dow", "weekend", "holiday", "month", "doy",
-    "prod", "staff", "prod_lag1h", "prod_lag2h", "prod_lead1h", "prod_lead2h", "staff_lead1h",
+    "prod", "prod_lag1h", "prod_lag2h", "prod_lead1h", "prod_lead2h",
     "is_prod_hour", "hours_from_first_prod", "hours_to_last_prod", "prod_start_hour", "prod_share_day", "lunch",
-    "day_prod", "day_prod_hours", "day_staff", "first_prod_hour", "last_prod_hour", "workday", "full_workday",
+    "day_prod", "day_prod_hours", "first_prod_hour", "last_prod_hour", "workday", "full_workday",
     "prev_day_prod", "next_day_prod", "days_since_workday", "restart_day",
 ]
 WEATHER_FEATS = ["temp", "humid", "wind", "rain", "cdd", "hdd", "temp_max", "temp_mean"]

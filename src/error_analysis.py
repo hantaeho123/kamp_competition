@@ -8,6 +8,7 @@ import pandas as pd
 from .config import PEAK_EVENT_KW, S2
 from .plotting import plt, save, C
 from .rules import fit_rules
+from .features import clock_state
 
 
 def add_conditions(df):
@@ -16,7 +17,6 @@ def add_conditions(df):
     d["abs_err"] = d["err"].abs()
     d["prod_bin"] = pd.cut(d["prod"], [-1, 0, 300, 1000, 2000, 1e9], labels=["0", "1-300", "300-1천", "1천-2천", "2천+"])
     d["temp_bin"] = pd.cut(d["temp"], [-20, 15, 22, 26, 40], labels=["<15", "15-22", "22-26", "26+"])
-    from .peak_types import clock_state
     d["phase"] = np.where(d["full_workday"] == 0, "비가동일", d["hour"].map(clock_state))
     return d
 
@@ -40,11 +40,11 @@ def run(oos: pd.DataFrame, tag="oos"):
         tables[col] = t
 
     # 피크 시간 MAE vs 전체 MAE (피크 구간 유형은 pipeline.step_error에서 슬롯에 붙임)
-    if "peak_type" in d:
+    if True:
         segs = [("전체", d), ("정상 가동일 08~17시", d[(d["full_workday"] == 1) & d["hour"].between(8, 16)]),
-                ("피크 시간(실측 180kW 이상)", d[d["kw"] >= PEAK_EVENT_KW]),
-                ("유형1 피크 구간(시작·재개 직후)", d[d["peak_type"] == 1]), ("유형2 피크 구간(가동 중)", d[d["peak_type"] == 2]),
-                ("피크 아닌 시간", d[d["kw"] < PEAK_EVENT_KW])]
+                ("피크 시간(실측 180kW 이상)", d[d["kw"] >= PEAK_EVENT_KW]), ("피크 아닌 시간", d[d["kw"] < PEAK_EVENT_KW])]
+        if "peak_type" in d:      # 4단계의 피크 유형이 슬롯에 붙어 있으면 유형별 오차도 함께 계산
+            segs += [("유형1 피크 구간(시작·재개 직후)", d[d["peak_type"] == 1]), ("유형2 피크 구간(가동 중)", d[d["peak_type"] == 2])]
         pk = pd.DataFrame([{"구간": n, "슬롯 수": len(x), "MAE": x["abs_err"].mean(), "RMSE": np.sqrt((x["err"] ** 2).mean()),
                             "Bias(예측-실측)": x["err"].mean(), "평균 실측(kW)": x["kw"].mean(),
                             "MAE/평균 실측 %": 100 * x["abs_err"].mean() / x["kw"].mean()} for n, x in segs])

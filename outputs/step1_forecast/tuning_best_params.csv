@@ -1,0 +1,8 @@
+﻿모델,최적 설정
+LightGBM,"{'n_estimators': 300, 'learning_rate': 0.0933, 'num_leaves': 54, 'min_child_samples': 25, 'subsample': 0.6727, 'colsample_bytree': 0.5917, 'reg_lambda': 0.0818, 'objective': 'regression'}"
+XGBoost,"{'n_estimators': 1200, 'learning_rate': 0.0105, 'max_depth': 8, 'min_child_weight': 3, 'subsample': 0.6492, 'colsample_bytree': 0.7281, 'reg_lambda': 0.7203}"
+CatBoost,"{'iterations': 1250, 'learning_rate': 0.031, 'depth': 8, 'l2_leaf_reg': 6.799}"
+RandomForest,"{'n_estimators': 500, 'max_depth': None, 'min_samples_leaf': 3, 'max_features': 0.5}"
+ExtraTrees,"{'n_estimators': 300, 'max_depth': None, 'min_samples_leaf': 3}"
+HistGradientBoosting,"{'max_iter': 600, 'learning_rate': 0.05, 'max_leaf_nodes': 31}"
+MLP,"{'hidden_layer_sizes': (256, 128, 64), 'alpha': 0.001, 'learning_rate_init': 0.0005}"

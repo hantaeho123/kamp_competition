@@ -9,4 +9,5 @@ from src.pipeline import run_all
 
 if __name__ == "__main__":
     # --reuse-cv : 모델 비교(백테스트) 결과 캐시 재사용(개발용). 기본은 전 과정 재실행
-    run_all(reuse_cv="--reuse-cv" in sys.argv)
+    # --tune     : 하이퍼파라미터 탐색부터 다시 수행(약 30분 추가). 기본은 기록된 최적 설정(src/tuning.py의 TUNED) 사용
+    run_all(reuse_cv="--reuse-cv" in sys.argv, tune="--tune" in sys.argv)

@@ -5,7 +5,7 @@ import lightgbm as lgb
 
 from .config import SEED
 
-DAY_FEATS = ["day_prod", "day_prod_hours", "day_staff", "first_prod_hour", "restart_day", "days_since_workday",
+DAY_FEATS = ["day_prod", "day_prod_hours", "first_prod_hour", "restart_day", "days_since_workday",
              "full_workday", "dow", "holiday", "month", "temp_max", "temp_mean", "prev_day_prod"]
 
 

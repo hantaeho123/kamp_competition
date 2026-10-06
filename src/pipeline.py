@@ -15,7 +15,7 @@ from .models import make_model, LGB_PARAMS
 from .experiment import sample_weight
 from .metrics import all_metrics, point_metrics
 from .peak_forecast import DailyPeakModel, day_frame
-from . import eda, error_analysis, peak_analysis, peak_shaving, peak_types
+from . import eda, error_analysis, peak_analysis, peak_shaving, peak_types, peak_prob, tuning
 from .plotting import plt, save, C
 
 LOG = []
@@ -137,7 +137,7 @@ def step_guidebook_replication(XD):
     return res
 
 
-def step_final(XD, oos_cv):
+def step_final(XD, oos_cv, final=None):
     """최종 모델 학습(9/1 이전 전체) -> 시험 구간 예측. 예측구간은 CV 표본외 잔차로 컨포멀 보정."""
     feats = feats_for("day_ahead", "plan")
     trm, tem = XD["ts"] < TEST_START, XD["ts"] >= TEST_START
@@ -146,7 +146,8 @@ def step_final(XD, oos_cv):
     m_cat = make_model("cat").fit(Xtr[feats], Xtr["kw"].values)
     Xte["pred_lgb"] = np.clip(m_lgb.predict(Xte[feats]), 0, None)
     Xte["pred_cat"] = np.clip(m_cat.predict(Xte[feats]), 0, None)
-    Xte["pred"] = Xte["pred_lgb"]   # 최종 점예측: LightGBM(선정 근거는 보고서 참조)
+    # 최종 점예측: 탐색·앙상블 비교(tuning.run)에서 선정된 앙상블. final이 없으면 LightGBM 단독
+    Xte["pred"] = final["test_pred"].reindex(Xte.index).values if final is not None else Xte["pred_lgb"]
     qs = {}
     for q in (0.1, 0.5, 0.85, 0.9):
         qs[q] = lgb.LGBMRegressor(objective="quantile", alpha=q, **LGB_PARAMS).fit(Xtr[feats], Xtr["kw"])
@@ -162,7 +163,7 @@ def step_final(XD, oos_cv):
                 tr_[feats], tr_["kw"]).predict(o[feats])
         parts.append(o)
     cvq = pd.concat(parts)
-    cvq["pred"] = oos_cv["LightGBM"]["pred"].values
+    cvq["pred"] = final["cv_pred"].reindex(cvq.index).values if final is not None else oos_cv["LightGBM"]["pred"].values
     v = cvq.dropna(subset=["kw"])
     # CQR(Conformalized Quantile Regression): 80% 구간 [q10, q90]의 표본외 부적합 점수 분위수만큼 확장
     score = np.maximum(v["q10"] - v["kw"], v["kw"] - v["q90"])
@@ -205,7 +206,7 @@ def step_final(XD, oos_cv):
         mdl = DailyPeakModel().fit(D[D.index < s])
         dparts.append(mdl.predict(D[(D.index >= s) & (D.index < e)]).join(D[["ymax", "full_workday"]]))
     dcv = pd.concat(dparts)
-    dcv["slot_model_max"] = oos_cv["LightGBM"].groupby("date")["pred"].max()
+    dcv["slot_model_max"] = cvq.groupby("date")["pred"].max()
     dcv["q90_max"] = cvq.groupby("date")["q90"].max()
 
     def dscore(df, col):
@@ -215,7 +216,7 @@ def step_final(XD, oos_cv):
         return {"MAE(전체일)": e.abs().mean(), "MAE(가동일)": e[w].abs().mean(), "Bias(가동일)": e[w].mean(),
                 "MAPE%(가동일)": 100 * (e[w].abs() / t.loc[w, "ymax"]).mean()}
 
-    names = {"slot_model_max": "15분 예측의 일 최대값(LightGBM)", "q90_max": "P90 분위수의 일 최대값",
+    names = {"slot_model_max": "15분 예측의 일 최대값(최종 모델)", "q90_max": "P90 분위수의 일 최대값",
              "dmax_rule": "규칙(직전 가동일 최대값)", "dmax_model": "일 단위 LightGBM", "dmax_pred": "피크 앙상블(제안)"}
     drows = []
     for col, nm in names.items():
@@ -226,10 +227,13 @@ def step_final(XD, oos_cv):
 
     # --- 시험 지표 ---
     test_rows = {}
-    for col, nm in [("pred_lgb", "LightGBM(최종)"), ("pred_cat", "CatBoost")]:
+    fname = "최종: " + final["name"] if final is not None else "LightGBM"
+    if final is not None:
+        test_rows[fname] = all_metrics(Xte)
+    for col, nm in [("pred_lgb", "LightGBM(기본값)"), ("pred_cat", "CatBoost(기본값)")]:
         test_rows[nm] = all_metrics(Xte.assign(pred=Xte[col]))
     ens = Xte.assign(pred=0.5 * Xte["pred_lgb"] + 0.5 * Xte["pred_cat"])
-    test_rows["앙상블(LightGBM+CatBoost)"] = all_metrics(ens)
+    test_rows["앙상블(LightGBM+CatBoost, 기본값)"] = all_metrics(ens)
     test_rows["B1 Naive(지난주 동시각)"] = all_metrics(Xte.assign(pred=Xte["lag672"].fillna(Xte["lag96"])))
     rule = make_model("rule").predict(Xte)
     test_rows["B2 규칙(직전 가동일 프로파일)"] = all_metrics(Xte.assign(pred=rule))
@@ -238,8 +242,8 @@ def step_final(XD, oos_cv):
     T = pd.DataFrame(test_rows).T
     tv = Xte.dropna(subset=["kw"])
     ev = (tv["kw"] >= PEAK_EVENT_KW).astype(int)
-    T["피크경보 F1(제안 경보규칙)"] = np.nan
-    T.loc["LightGBM(최종)", "피크경보 F1(제안 경보규칙)"] = f1_score(ev, tv["peak_alert"])
+    T["피크 판정 F1(전력량 예측값 기준선)"] = np.nan
+    T.loc[T.index[0], "피크 판정 F1(전력량 예측값 기준선)"] = f1_score(ev, tv["peak_alert"])
     T.round(3).to_csv(S1 / "test_metrics.csv", encoding="utf-8-sig")
 
     # 특성 중요도(SHAP)
@@ -269,10 +273,21 @@ def step_final(XD, oos_cv):
     return Xte, cvq, dp, dcv, T, DP, imp, pairs, info, m_lgb
 
 
+def step_probability(XD, oos, Xte, cvq):
+    """피크 발생 확률 모델(peak_prob.run)을 돌리고, 최종 확률·경보를 시험/백테스트 프레임에 붙인다.
+    이후 경보·놓친 피크·헛경보 분석은 모두 이 확률 경보 기준."""
+    cvp, tep, PT, CAL, top, pinfo = peak_prob.run(XD, cvq, Xte)
+    for d, src in ((Xte, tep), (cvq, cvp)):
+        d["peak_prob"] = src["peak_prob"].values
+        d["peak_alert"] = src["peak_prob_alert"].values
+        d["pred_alert"] = np.where(d["peak_alert"] == 1, PEAK_EVENT_KW, 0)     # error_analysis의 경보 판정용
+    return Xte, cvq, PT, CAL, top, pinfo
+
+
 def step_save_predictions(Xte, dp):
     cols = {"ts": "일시(15분 시작)", "date": "날짜", "hour": "시간", "quarter": "15분구간(0~3)", "kw": "실측(kW)",
             "pred": "예측(kW)", "q10": "P10", "q90": "P90", "lo80": "80%구간 하한(보정)", "hi80": "80%구간 상한(보정)",
-            "peak_alert": "피크위험 경보(1=경보)"}
+            "peak_prob": "피크 발생 확률(보정)", "peak_alert": "피크위험 경보(1=경보)"}
     out = Xte[list(cols)].rename(columns=cols).round(2)
     out.to_csv(PRED / "test_predictions_15min.csv", index=False, encoding="utf-8-sig")
     # 원본 포맷(1행=1시간, 15분/30분/45분/60분 + 평균)
@@ -293,7 +308,7 @@ def step_plots(Xte, R, dp):
     fig, ax = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
     ax[0].fill_between(Xte["ts"], Xte["lo80"], Xte["hi80"], color=C["band"], alpha=.5, label="80% 예측구간(컨포멀 보정)")
     ax[0].plot(Xte["ts"], Xte["kw"], color=C["actual"], lw=.8, label="실측")
-    ax[0].plot(Xte["ts"], Xte["pred"], color=C["pred"], lw=.9, label="예측(LightGBM, 하루 전)")
+    ax[0].plot(Xte["ts"], Xte["pred"], color=C["pred"], lw=.9, label="예측(하루 전, 최종 모델)")
     al = Xte[Xte["peak_alert"] == 1]
     ax[0].scatter(al["ts"], np.full(len(al), 228), marker="|", color=C["peak"], s=30, label="피크위험 경보")
     ax[0].axhline(PEAK_EVENT_KW, ls="--", color=C["peak"], lw=.7)
@@ -417,7 +432,7 @@ def step_error(oos_all, E):
     return error_analysis.run(o, "oos")
 
 
-def run_all(reuse_cv=False):
+def run_all(reuse_cv=False, tune=False):
     t0 = time.time()
     raw, hourly, L = load_clean()
     log("[0] 데이터 전처리 및 분할")
@@ -435,7 +450,22 @@ def run_all(reuse_cv=False):
     else:
         R, oos = step_compare(XD, XH)
         pd.to_pickle((R, oos), cache)
-    Xte, cvq, dp, dcv, T, DP, imp, pairs, info, model = step_final(XD, oos)
+    log("[1] 전력 예측: 탐색된 설정의 7종 모델과 앙상블 5종 비교 -> 최종 모델 선정")
+    tcache = OUT / "cache_tuning.pkl"
+    if tune:
+        best = tuning.search(XD, log=log)
+        TRES, TR, BP, W, final = tuning.run(XD, best, log=log)
+        pd.to_pickle((TRES, final), tcache)
+    elif reuse_cv and tcache.exists():
+        TRES, final = pd.read_pickle(tcache)
+        TRES.round(3).to_csv(S1 / "tuning_and_ensemble_comparison.csv", index=False, encoding="utf-8-sig")
+        log("  (캐시된 앙상블 결과 사용)")
+    else:
+        TRES, TR, BP, W, final = tuning.run(XD, log=log)
+        pd.to_pickle((TRES, final), tcache)
+    Xte, cvq, dp, dcv, T, DP, imp, pairs, info, model = step_final(XD, oos, final)
+    Xte, cvq, PT, CAL, top, pinfo = step_probability(XD, oos, Xte, cvq)
+    info.update(pinfo)
     step_save_predictions(Xte, dp)
     step_plots(Xte, R, dp)
     log("[3] 실제 피크 구간 추출")
@@ -443,15 +473,14 @@ def run_all(reuse_cv=False):
     log("[4] 피크 두 유형 구분")
     E, sil, type_prof = peak_types.step4_types(E, XD)
     log("[2] 예측오차 분석(표본 외: 백테스트 8주 + 시험 2주, 피크 유형 포함)")
-    oos_all = pd.concat([cvq.assign(pred_alert=np.where(cvq[info["alert_signal"]] >= info["alert_threshold_kW"], PEAK_EVENT_KW, 0)),
-                         Xte])
+    oos_all = pd.concat([cvq, Xte])
     _, et = step_error(oos_all, E)
     log("[5] 유형별 발생조건(+ 슬롯 단위 피크 조건 보조 분석)")
     cond = peak_types.step5_conditions(E, XD)
     pk = peak_analysis.run(XD)
     log("[6] 유형별 저감방안 시뮬레이션 + 예측 연동 운영 검증")
     S, bytype, P = step_mitigation(XD, Xte, dp, E)
-    summary = {"data_quality": rep, "final_model": "LightGBM(하루 전, 생산계획+달력+기상)",
+    summary = {"data_quality": rep, "final_model": final["name"] + " (" + ", ".join(final["members"]) + ")",
                "test_metrics": T.round(3).to_dict(orient="index"), "uncertainty_alert": info,
                "peak_extraction": ext_summ.to_dict(),
                "tariff": {"name": TARIFF_NAME, "basic_krw_per_kw": BASIC_CHARGE_KRW_PER_KW},

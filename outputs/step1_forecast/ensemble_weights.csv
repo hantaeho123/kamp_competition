@@ -1,0 +1,8 @@
+﻿,가중치
+LightGBM,0.0
+XGBoost,0.0
+CatBoost,0.214
+RandomForest,0.0
+ExtraTrees,0.748
+HistGradientBoosting,0.028
+MLP,0.01

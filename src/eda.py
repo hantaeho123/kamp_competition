@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from .config import S0, QUARTER_COLS, TEST_START, CV_FOLD_STARTS, CV_FOLD_DAYS
+from .config import S0, QUARTER_COLS, TEST_START, CV_FOLD_STARTS, CV_FOLD_DAYS, DATA_START
 from .data import diagnose
 from .plotting import plt, save, C
 
@@ -18,6 +18,7 @@ def run(raw, hourly, L):
         ["15분 단발 0값", "6개 슬롯(08-28, 08-29, 09-08)", "대기전력(약 21kW)보다 낮은 0kW가 정상 부하 사이에 1~2슬롯 출현", "계측 누락으로 결측 처리"],
         ["강수량 누적값", "전 기간", "1시에 초기화되는 일 누적값, 0시 행에 전일 합계", "시간 강수량으로 차분 변환"],
         ["결측", "풍속 3, 강수량 1, 공장인원 17", "산발 결측", "선형보간 / 0(비가동)"],
+        ["공장인원(누수 변수)", "생산이 있는 3,511행", "공장인원 = 생산량 / (4개 15분 전력의 합)으로 계산된 값(오차 1e-8 이하)", "모델 입력에서 제거"],
         ["(날짜,시간) 중복 키", "5건", "손상된 '시간' 값끼리 우연히 같음", "시간 재구성으로 해소"],
         ["계획-실적 불일치", "일요일 특근 등", "생산계획 0인데 설비 가동(최대 130kW)", "오차분석의 별도 조건으로 분리"],
     ], columns=["항목", "범위", "근거", "처리"])
@@ -96,24 +97,25 @@ def split_table(X):
         e = s + pd.Timedelta(days=CV_FOLD_DAYS)
         tr = (X["ts"] < s) & y
         va = (X["ts"] >= s) & (X["ts"] < e) & y
-        rows.append({"구분": f"Valid fold {i}", "학습 구간": f"2021-01-01 ~ {(s - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
+        rows.append({"구분": f"Valid fold {i}", "학습 구간": f"{DATA_START} ~ {(s - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
                      "평가 구간": f"{s.date()} ~ {(e - pd.Timedelta(days=1)).date()}", "평가 슬롯 수": int(va.sum()),
                      "평가 구간 내 복사일 수": int(X.loc[va & (X["aug_size"] > 1), "date"].nunique())})
     t = pd.Timestamp(TEST_START)
     tr = (X["ts"] < t) & y
     te = (X["ts"] >= t) & y
-    rows.append({"구분": "Test(최종 1회)", "학습 구간": f"2021-01-01 ~ {(t - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
+    rows.append({"구분": "Test(최종 1회)", "학습 구간": f"{DATA_START} ~ {(t - pd.Timedelta(days=1)).date()}", "학습 슬롯 수": int(tr.sum()),
                  "평가 구간": f"{t.date()} ~ {X['ts'].max().date()}", "평가 슬롯 수": int(te.sum()),
                  "평가 구간 내 복사일 수": int(X.loc[te & (X["aug_size"] > 1), "date"].nunique())})
     T = pd.DataFrame(rows)
     T.to_csv(S0 / "train_valid_test_split.csv", index=False, encoding="utf-8-sig")
     drop = pd.DataFrame([
         ["평균", "예측 대상 4개 값의 평균(목표값 그 자체)", "제거"],
+        ["공장인원", "공장인원 = 생산량 / (15분+30분+45분+60분 전력 합). 생산이 있는 3,511행 모두에서 오차 1e-8 이하로 일치 -> 생산량과 함께 쓰면 그 시간의 전력을 역산할 수 있음", "제거(파생 변수 포함)"],
         ["15분/30분/45분/60분(같은 시각)", "예측 대상", "입력에서 제거, 목표값으로만 사용"],
         ["전기요금(계절)", "월만으로 결정(값 3개)", "제거(월과 중복)"],
         ["인건비", "시각만으로 결정(9~17시 1.0, 그 외 1.5)", "제거(시각과 중복)"],
         ["시간(원본)", "07-13, 07-15에 손상", "행 순서로 재구성한 시각 사용, 두 날 전력은 제외"],
-        ["전력 지연값(전일·전주 등)", "복사일이 날짜 간 연속성을 깨뜨림(백테스트 MAE 7.73 -> 11.99로 악화)", "최종 모델에서 제외"],
+        ["전력 지연값(전일·전주 등)", "1단계 입력 구성 검증에서 넣었을 때와 뺐을 때의 백테스트 MAE를 비교해 결정", "최종 모델에서 제외"],
     ], columns=["변수", "근거", "처리"])
     drop.to_csv(S0 / "leakage_and_redundant_variables.csv", index=False, encoding="utf-8-sig")
     return T
